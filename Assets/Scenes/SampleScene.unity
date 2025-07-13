@@ -1052,7 +1052,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &436358033
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -2322,7 +2322,8 @@ MonoBehaviour:
   cameraManager: {fileID: 825682208}
   rawImage: {fileID: 1040099461}
   runSchedule: 0.1
-  modelAsset: {fileID: 5022602860645237092, guid: 35418136a2520408caab40305c9bf3e2,
+  paintColor: {r: 0, g: 0, b: 1, a: 1}
+  modelAsset: {fileID: 5022602860645237092, guid: 4deddbd2f1c354a248b3b322f32c40c9,
     type: 3}
 --- !u!1 &846715049
 GameObject:
