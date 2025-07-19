@@ -1,10 +1,12 @@
 using System;
 using System.Collections;
+using TMPro;
 using Unity.Barracuda;
 using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.XR.ARFoundation;
 using UnityEngine.XR.ARSubsystems;
+using System.Linq;
 
 public class SegmentationManager : MonoBehaviour
 {
@@ -15,28 +17,26 @@ public class SegmentationManager : MonoBehaviour
       [Header("UI")]
       [SerializeField]
       private RawImage rawImage;
+      [SerializeField]
+      private TextMeshProUGUI classNameText;
+      [Tooltip("How long the class name stays on screen in seconds.")]
+      [SerializeField]
+      private float displayNameDuration = 3.0f;
 
       [Header("ML Model")]
       [Tooltip("How often to run the model in seconds. A lower number is more responsive but more performance-intensive.")]
       [SerializeField]
-      private float runSchedule = 0.1f;
+      private float runSchedule = 0.2f;
 
       [Tooltip("The color to use for painting segmented objects.")]
       public Color paintColor = Color.blue;
 
-      [Tooltip("The model to use for segmentation. This must be a .onnx file.")]
+      [Tooltip("The model to use for segmentation. This can be an .onnx or .tflite file.")]
       [SerializeField]
       private NNModel modelAsset;
-      private const string ModelName = "model.onnx";
 
-      // This field is no longer needed as post-processing is done on the CPU.
-      // [Tooltip("The compute file to use for post-processing. This must be a .compute file.")]
-      // [SerializeField]
-      // private ComputeShader postProcessShader;
-
-      // TODO: The size of the image the model expects.
-      // You might need to change this depending on the model you are using.
-      private readonly Vector2Int imageSize = new Vector2Int(256, 256);
+      // These are now set dynamically in Start() based on the selected model
+      private Vector2Int imageSize;
 
       private IWorker worker;
       private Model model;
@@ -48,10 +48,23 @@ public class SegmentationManager : MonoBehaviour
       private Tensor lastOutputTensor;
 
       // The class index of the object to be painted
-      private int classIndexToPaint = -1; // -1 means nothing is selected for painting
+      private int classIndexToPaint = -1; // -1 means nothing is selected for painting, show all classes
+
+      private Coroutine displayNameCoroutine;
 
       // Timer for scheduling model runs
       private float lastRunTime;
+
+      // Frame skipping for performance
+      private int frameCounter = 0;
+      private const int frameSkip = 0; // Process every frame for better responsiveness
+
+      // Flag to prevent repeated logging
+      private bool hasLoggedStatistics = false;
+
+      // For double-tap detection
+      private float lastTapTime = 0f;
+      private const float doubleTapThreshold = 0.5f;
 
       private void Start()
       {
@@ -63,10 +76,53 @@ public class SegmentationManager : MonoBehaviour
                   arCameraBackground.enabled = true;
             }
 
+            // A model asset is required. If not set, disable the component.
+            if (modelAsset == null)
+            {
+                  Debug.LogError("Model Asset is not assigned. Please assign a model in the Inspector.", this);
+                  enabled = false;
+                  return;
+            }
+
+            // --- DYNAMIC SETTINGS BASED ON MODEL ---
+            // Automatically configure settings based on the model assigned in the Inspector
+            if (modelAsset.name.Contains("TopFormer"))
+            {
+                  Debug.Log("TopFormer model detected. Adjusting settings for the high-resolution model.");
+                  imageSize = new Vector2Int(512, 512); // TopFormer requires 512x512
+                  runSchedule = 0.5f; // Faster updates - reduced from 1.0f to 0.5f
+                  Application.targetFrameRate = 25; // Slightly higher FPS
+                  Debug.LogWarning("IMPORTANT: For TopFormer, ensure your ColorMap.cs uses ADE20K dataset classes!");
+            }
+            else // Default to settings for a lighter model like CamVid
+            {
+                  Debug.Log("Lightweight model detected (e.g., CamVid). Using performance-oriented settings.");
+                  imageSize = new Vector2Int(224, 224); // CamVid uses 224x224
+                  runSchedule = 0.2f; // Faster updates
+                  Application.targetFrameRate = 30; // Higher FPS is fine
+                  Debug.LogWarning("IMPORTANT: For this model, ensure your ColorMap.cs uses CamVid dataset classes!");
+            }
+
             // Load the model
             model = ModelLoader.Load(modelAsset);
+
+            // Log model information for debugging
+            Debug.Log($"Model loaded: {modelAsset.name}. Using input size {imageSize.x}x{imageSize.y}");
+            foreach (var input in model.inputs)
+            {
+                  Debug.Log($"Model input: {input.name}, shape: {input.shape}");
+            }
+            foreach (var output in model.outputs)
+            {
+                  Debug.Log($"Model output: {output}");
+            }
+
             worker = model.CreateWorker();
-            Application.targetFrameRate = 60;
+
+            QualitySettings.vSyncCount = 0;   // Disable VSync for better performance
+
+            // Show all classes by default
+            classIndexToPaint = -1;
       }
 
       private void OnEnable()
@@ -88,6 +144,14 @@ public class SegmentationManager : MonoBehaviour
 
       private void OnCameraFrameReceived(ARCameraFrameEventArgs eventArgs)
       {
+            // Skip frames for better performance
+            frameCounter++;
+            if (frameCounter <= frameSkip)
+            {
+                  return;
+            }
+            frameCounter = 0;
+
             if (Time.time - lastRunTime < runSchedule)
             {
                   return;
@@ -132,39 +196,58 @@ public class SegmentationManager : MonoBehaviour
       {
             using var inputTensor = new Tensor(texture, 3);
 
-            worker.Execute(inputTensor);
-
-            // Get the output and dispose of the previous one
-            lastOutputTensor?.Dispose();
-            lastOutputTensor = worker.PeekOutput();
-
-            // On the first run, initialize the texture with the correct size from the model output
-            if (segmentationTexture == null || segmentationTexture.width != lastOutputTensor.width || segmentationTexture.height != lastOutputTensor.height)
+            try
             {
-                  segmentationTexture = new Texture2D(lastOutputTensor.width, lastOutputTensor.height, TextureFormat.RGBA32, false)
+                  worker.Execute(inputTensor);
+
+                  // Get the output and dispose of the previous one
+                  lastOutputTensor?.Dispose();
+                  lastOutputTensor = worker.PeekOutput();
+
+                  // On the first run, initialize the texture with the correct size from the model output
+                  if (segmentationTexture == null)
                   {
-                        filterMode = FilterMode.Bilinear
-                  };
-                  rawImage.texture = segmentationTexture;
+                        segmentationTexture = new Texture2D(imageSize.x, imageSize.y, TextureFormat.RGBA32, false)
+                        {
+                              filterMode = FilterMode.Bilinear
+                        };
+                        rawImage.texture = segmentationTexture;
 
-                  // Log model output details once to help with debugging
-                  Debug.Log($"Model output initialized. Texture size: {lastOutputTensor.width}x{lastOutputTensor.height}, Channels/Classes: {lastOutputTensor.channels}");
+                        // Log model output details once to help with debugging
+                        Debug.Log($"Model output initialized. Texture size: {lastOutputTensor.width}x{lastOutputTensor.height}, Channels/Classes: {lastOutputTensor.channels}");
+
+                        // Debug: Show which classes are most common in the current frame (only once)
+                        if (!hasLoggedStatistics)
+                        {
+                              LogClassStatistics();
+                              hasLoggedStatistics = true;
+                        }
+                  }
+
+                  // Process the output and update the texture
+                  SegmentationPostProcessing.ProcessOutput(lastOutputTensor, segmentationTexture, classIndexToPaint, paintColor);
+
+                  // Adjust RawImage aspect ratio to match the screen
+                  var screenAspect = (float)Screen.width / Screen.height;
+                  var imageAspect = (float)segmentationTexture.width / segmentationTexture.height;
+
+                  if (screenAspect > imageAspect)
+                  {
+                        rawImage.rectTransform.localScale = new Vector3(imageAspect / screenAspect, 1, 1);
+                  }
+                  else
+                  {
+                        rawImage.rectTransform.localScale = new Vector3(1, screenAspect / imageAspect, 1);
+                  }
             }
-
-            // Process the output and update the texture
-            SegmentationPostProcessing.ProcessOutput(lastOutputTensor, segmentationTexture, classIndexToPaint, paintColor);
-
-            // Adjust RawImage aspect ratio to match the screen
-            var screenAspect = (float)Screen.width / Screen.height;
-            var imageAspect = (float)segmentationTexture.width / segmentationTexture.height;
-
-            if (screenAspect > imageAspect)
+            catch (Exception e)
             {
-                  rawImage.rectTransform.localScale = new Vector3(imageAspect / screenAspect, 1, 1);
-            }
-            else
-            {
-                  rawImage.rectTransform.localScale = new Vector3(1, screenAspect / imageAspect, 1);
+                  Debug.LogError($"Model execution failed: {e.Message}");
+                  if (inputTensor != null)
+                  {
+                        Debug.LogError($"Input tensor shape: {inputTensor.shape}");
+                  }
+                  Debug.LogError("Try adjusting the imageSize to match model requirements or assign a different model.");
             }
 
             // Clean up
@@ -173,12 +256,86 @@ public class SegmentationManager : MonoBehaviour
             yield return null;
       }
 
+      private void LogClassStatistics()
+      {
+            if (lastOutputTensor == null) return;
+
+            var classCount = new int[lastOutputTensor.channels];
+
+            // Count pixels for each class
+            for (int y = 0; y < lastOutputTensor.height; y++)
+            {
+                  for (int x = 0; x < lastOutputTensor.width; x++)
+                  {
+                        int maxClass = 0;
+                        float maxScore = float.MinValue;
+
+                        for (int c = 0; c < lastOutputTensor.channels; c++)
+                        {
+                              var score = lastOutputTensor[0, y, x, c];
+                              if (score > maxScore)
+                              {
+                                    maxScore = score;
+                                    maxClass = c;
+                              }
+                        }
+                        classCount[maxClass]++;
+                  }
+            }
+
+            Debug.Log("=== CLASS STATISTICS ===");
+            for (int i = 0; i < classCount.Length; i++)
+            {
+                  if (classCount[i] > 0)
+                  {
+                        string className = i < ColorMap.classNames.Length ? ColorMap.classNames[i] : $"Class {i}";
+                        Debug.Log($"Class {i} ({className}): {classCount[i]} pixels");
+                  }
+            }
+            Debug.Log("========================");
+      }
+
       void Update()
       {
             // Check for screen tap
             if (Input.GetMouseButtonDown(0))
             {
-                  HandleTap(Input.mousePosition);
+                  float currentTime = Time.time;
+
+                  // Check for double tap to clear selection
+                  if (currentTime - lastTapTime < doubleTapThreshold)
+                  {
+                        // Double tap detected - clear selection
+                        classIndexToPaint = -1;
+                        Debug.Log("Selection cleared. Showing all classes.");
+
+                        if (displayNameCoroutine != null)
+                        {
+                              StopCoroutine(displayNameCoroutine);
+                        }
+                        if (classNameText != null)
+                        {
+                              classNameText.text = "Selection cleared";
+                              classNameText.enabled = true;
+                              StartCoroutine(HideTextAfterDelay());
+                        }
+                  }
+                  else
+                  {
+                        // Single tap - select class
+                        HandleTap(Input.mousePosition);
+                  }
+
+                  lastTapTime = currentTime;
+            }
+      }
+
+      private IEnumerator HideTextAfterDelay()
+      {
+            yield return new WaitForSeconds(1.5f);
+            if (classNameText != null)
+            {
+                  classNameText.enabled = false;
             }
       }
 
@@ -227,6 +384,13 @@ public class SegmentationManager : MonoBehaviour
                         string className = ColorMap.classNames[classIndex];
                         Debug.Log($"You tapped on: {className} (class index: {classIndex}). Painting it.");
 
+                        // Show class name on UI
+                        if (displayNameCoroutine != null)
+                        {
+                              StopCoroutine(displayNameCoroutine);
+                        }
+                        displayNameCoroutine = StartCoroutine(ShowClassName(className));
+
                         // Set the class index to be painted
                         classIndexToPaint = classIndex;
                   }
@@ -234,6 +398,17 @@ public class SegmentationManager : MonoBehaviour
                   {
                         Debug.LogWarning($"Tapped on an object with an invalid class index: {classIndex}.");
                   }
+            }
+      }
+
+      private IEnumerator ShowClassName(string name)
+      {
+            if (classNameText != null)
+            {
+                  classNameText.text = $"Tapped on: {name}";
+                  classNameText.enabled = true;
+                  yield return new WaitForSeconds(displayNameDuration);
+                  classNameText.enabled = false;
             }
       }
 }

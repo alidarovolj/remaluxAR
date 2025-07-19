@@ -2321,9 +2321,11 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   cameraManager: {fileID: 825682208}
   rawImage: {fileID: 1040099461}
+  classNameText: {fileID: 0}
+  displayNameDuration: 3
   runSchedule: 0.1
   paintColor: {r: 0, g: 0, b: 1, a: 1}
-  modelAsset: {fileID: 5022602860645237092, guid: 4deddbd2f1c354a248b3b322f32c40c9,
+  modelAsset: {fileID: 5022602860645237092, guid: 37cd09fbcd27344fe8b8294f637cbf9f,
     type: 3}
 --- !u!1 &846715049
 GameObject:
