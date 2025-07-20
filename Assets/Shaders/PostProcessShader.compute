@@ -1,0 +1,80 @@
+#pragma kernel CSMain
+
+// The model output tensor data as a structured buffer.
+StructuredBuffer<float> TensorData;
+
+// The output texture that will be displayed on screen.
+RWTexture2D<float4> OutputTexture;
+
+// A buffer containing the colors for each class index.
+StructuredBuffer<float4> ColorMap;
+
+// Tensor dimensions and parameters
+int tensorWidth;
+int tensorHeight;
+int numClasses;
+int classIndexToPaint;
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    // Get the dimensions of our output texture
+    uint outputWidth, outputHeight;
+    OutputTexture.GetDimensions(outputWidth, outputHeight);
+
+    // Stop if we're trying to write outside the texture bounds
+    if (id.x >= outputWidth || id.y >= outputHeight)
+    {
+        return;
+    }
+
+    // --- High-Quality Upsampling ---
+    // Calculate the corresponding coordinate in the low-resolution model output tensor.
+    float2 uv = float2(id.x / (float)outputWidth, id.y / (float)outputHeight);
+    
+    // Map the UV coordinate to the integer-based coordinates of the input tensor
+    uint sampleX = (uint)(uv.x * (tensorWidth - 1));
+    uint sampleY = (uint)(uv.y * (tensorHeight - 1));
+
+    // --- Find the dominant class ---
+    // Iterate through all class scores at the sampled position to find the one with the highest score.
+    int dominantClass = 0;
+    float maxScore = -1.0f;
+
+    for (int c = 0; c < numClasses; c++)
+    {
+        // Calculate the index in the flattened tensor data
+        // Tensor layout: [height, width, channels] so index = y * width * channels + x * channels + c
+        int tensorIndex = sampleY * tensorWidth * numClasses + sampleX * numClasses + c;
+        float score = TensorData[tensorIndex];
+        
+        if (score > maxScore)
+        {
+            maxScore = score;
+            dominantClass = c;
+        }
+    }
+
+    // Get the base color for the dominant class.
+    float4 pixelColor = ColorMap[dominantClass];
+
+    // --- Apply Highlighting Effects ---
+    if (classIndexToPaint != -1 && dominantClass == classIndexToPaint)
+    {
+        // Make the selected class almost fully opaque and bright.
+        pixelColor.a = 0.85f; // 220 in byte terms
+    }
+    else if (classIndexToPaint == -1)
+    {
+        // When nothing is selected, make all classes semi-transparent.
+        pixelColor.a = 0.55f; // 140 in byte terms
+    }
+    else
+    {
+        // When a class is selected, dim the other classes by making them very transparent.
+        pixelColor.a = 0.2f; // 50 in byte terms
+    }
+
+    // Write the final color to the output texture.
+    OutputTexture[id.xy] = pixelColor;
+} 

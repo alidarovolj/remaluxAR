@@ -23,10 +23,24 @@ public class SegmentationManager : MonoBehaviour
       [SerializeField]
       private float displayNameDuration = 3.0f;
 
+      [Header("Performance Monitoring")]
+      [SerializeField, Tooltip("Показывать статистику производительности на экране")]
+      private bool showPerformanceStats = true;
+      [SerializeField]
+      private TextMeshProUGUI performanceText;
+      
+      [Header("Performance Control")]
+      [SerializeField, Tooltip("Режим экстремальной оптимизации для слабых устройств")]
+      private bool extremeOptimizationMode = false;
+      [SerializeField, Tooltip("Пауза обработки модели (только камера)")]
+      private bool pauseModelProcessing = false;
+      [SerializeField, Tooltip("Максимальное время обработки модели в миллисекундах")]
+      private float maxModelProcessingTime = 200f; // 200ms
+
       [Header("ML Model")]
       [Tooltip("How often to run the model in seconds. A lower number is more responsive but more performance-intensive.")]
       [SerializeField]
-      private float runSchedule = 0.2f;
+      private float runSchedule = 1.0f; // Increased from 0.2f
 
       [Tooltip("The color to use for painting segmented objects.")]
       public Color paintColor = Color.blue;
@@ -35,17 +49,34 @@ public class SegmentationManager : MonoBehaviour
       [SerializeField]
       private NNModel modelAsset;
 
+      [Header("GPU Post-Processing")]
+      [SerializeField]
+      private ComputeShader postProcessShader;
+      [Tooltip("Override model's default resolution. Set to 0 to disable.")]
+      [SerializeField]
+      private Vector2Int overrideResolution = new Vector2Int(256, 256);
+
       // These are now set dynamically in Start() based on the selected model
       private Vector2Int imageSize;
 
+      // Barracuda inference
       private IWorker worker;
       private Model model;
-
-      // Texture to hold the segmentation mask
-      private Texture2D segmentationTexture;
-
-      // The last output from the model
       private Tensor lastOutputTensor;
+      
+      // Texture to hold the segmentation mask
+      private RenderTexture segmentationTexture;
+      
+      // Compute Shader for post-processing
+      private int postProcessKernel;
+      private ComputeBuffer colorMapBuffer;
+      private ComputeBuffer tensorDataBuffer; // Buffer for tensor data
+
+      // Reusable input texture to avoid memory allocations
+      private Texture2D inputTexture;
+
+      // Reusable buffer for pixel data to avoid GC allocations
+      private Color32[] pixelBuffer;
 
       // The class index of the object to be painted
       private int classIndexToPaint = -1; // -1 means nothing is selected for painting, show all classes
@@ -55,16 +86,37 @@ public class SegmentationManager : MonoBehaviour
       // Timer for scheduling model runs
       private float lastRunTime;
 
-      // Frame skipping for performance
+      // Frame skipping for performance - now dynamic
       private int frameCounter = 0;
-      private const int frameSkip = 0; // Process every frame for better responsiveness
-
-      // Flag to prevent repeated logging
-      private bool hasLoggedStatistics = false;
+      private int frameSkip = 3; // Will be set by PerformanceManager
 
       // For double-tap detection
       private float lastTapTime = 0f;
       private const float doubleTapThreshold = 0.5f;
+
+      // Performance monitoring
+      private float frameTime = 0f;
+      private int frameCount = 0;
+      private float modelProcessingTime = 0f;
+      private int modelRunCount = 0;
+      private float averageModelTime = 0f;
+      private System.DateTime lastStatsUpdate;
+
+      // Performance management integration
+      private PerformanceManager performanceManager;
+      private string currentQualityLevel = "Medium";
+
+      // Model compatibility
+      private bool modelInitialized = false;
+      private Vector2Int validatedImageSize;
+      
+      // Advanced performance tracking
+      private float recentModelTimes = 0f;
+      private int recentModelCount = 0;
+      private float lastModelTime = 0f;
+      private bool autoOptimizationEnabled = true;
+      private int consecutiveSlowFrames = 0;
+      private float targetModelTime = 100f; // 100ms target
 
       private void Start()
       {
@@ -84,30 +136,20 @@ public class SegmentationManager : MonoBehaviour
                   return;
             }
 
-            // --- DYNAMIC SETTINGS BASED ON MODEL ---
-            // Automatically configure settings based on the model assigned in the Inspector
-            if (modelAsset.name.Contains("TopFormer"))
+            // Initialize performance manager integration
+            performanceManager = FindFirstObjectByType<PerformanceManager>();
+            if (performanceManager != null)
             {
-                  Debug.Log("TopFormer model detected. Adjusting settings for the high-resolution model.");
-                  imageSize = new Vector2Int(512, 512); // TopFormer requires 512x512
-                  runSchedule = 0.5f; // Faster updates - reduced from 1.0f to 0.5f
-                  Application.targetFrameRate = 25; // Slightly higher FPS
-                  Debug.LogWarning("IMPORTANT: For TopFormer, ensure your ColorMap.cs uses ADE20K dataset classes!");
-            }
-            else // Default to settings for a lighter model like CamVid
-            {
-                  Debug.Log("Lightweight model detected (e.g., CamVid). Using performance-oriented settings.");
-                  imageSize = new Vector2Int(224, 224); // CamVid uses 224x224
-                  runSchedule = 0.2f; // Faster updates
-                  Application.targetFrameRate = 30; // Higher FPS is fine
-                  Debug.LogWarning("IMPORTANT: For this model, ensure your ColorMap.cs uses CamVid dataset classes!");
+                  performanceManager.OnQualityChanged += OnQualitySettingsChanged;
+                  Debug.Log("PerformanceManager integration enabled");
             }
 
-            // Load the model
+            // Load the model first
             model = ModelLoader.Load(modelAsset);
 
             // Log model information for debugging
-            Debug.Log($"Model loaded: {modelAsset.name}. Using input size {imageSize.x}x{imageSize.y}");
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            Debug.Log($"Model loaded: {modelAsset.name}");
             foreach (var input in model.inputs)
             {
                   Debug.Log($"Model input: {input.name}, shape: {input.shape}");
@@ -116,13 +158,316 @@ public class SegmentationManager : MonoBehaviour
             {
                   Debug.Log($"Model output: {output}");
             }
+#endif
 
-            worker = model.CreateWorker();
+            // Use GPU for inference. This is the single most important optimization.
+            // The backend is selected by device type.
+            worker = WorkerFactory.CreateWorker(model, WorkerFactory.Device.GPU);
+            Debug.Log($"Using Barracuda worker type: {worker.Summary()}");
+
+            if (overrideResolution.x > 0 && overrideResolution.y > 0)
+            {
+                validatedImageSize = overrideResolution;
+                imageSize = overrideResolution;
+                Debug.Log($"Using OVERRIDE resolution: {imageSize}");
+                OnModelReady();
+            }
+            else
+            {
+                // Auto-detect optimal image size for the model
+                StartCoroutine(DetectOptimalImageSize());
+            }
 
             QualitySettings.vSyncCount = 0;   // Disable VSync for better performance
 
+            // Initialize performance monitoring
+            lastStatsUpdate = System.DateTime.Now;
+
             // Show all classes by default
             classIndexToPaint = -1;
+      }
+
+      void OnModelReady()
+      {
+            modelInitialized = true;
+            CreateInputTexture();
+            InitializeGpuResources();
+      }
+
+      private void InitializeGpuResources()
+      {
+            if (postProcessShader == null)
+            {
+                  // Try to find the PostProcessShader automatically
+                  postProcessShader = Resources.Load<ComputeShader>("PostProcessShader");
+                  if (postProcessShader == null)
+                  {
+                        // Alternative path - look in Shaders folder
+                        var shaderGuid = UnityEditor.AssetDatabase.FindAssets("PostProcessShader t:ComputeShader");
+                        if (shaderGuid.Length > 0)
+                        {
+                              var path = UnityEditor.AssetDatabase.GUIDToAssetPath(shaderGuid[0]);
+                              postProcessShader = UnityEditor.AssetDatabase.LoadAssetAtPath<ComputeShader>(path);
+                        }
+                  }
+            }
+
+            if (postProcessShader == null)
+            {
+                  Debug.LogError("Post Process Shader is not assigned!", this);
+                  return;
+            }
+
+            postProcessKernel = postProcessShader.FindKernel("CSMain");
+
+            // Create a RenderTexture for the shader to write to. This will be displayed on the UI.
+            segmentationTexture = new RenderTexture(imageSize.x, imageSize.y, 0, RenderTextureFormat.ARGB32);
+            segmentationTexture.enableRandomWrite = true;
+            segmentationTexture.Create();
+            rawImage.texture = segmentationTexture;
+
+            // Create a buffer to hold the class colors and send it to the GPU.
+            var colors = ColorMap.GetAllColors();
+            colorMapBuffer = new ComputeBuffer(colors.Length, sizeof(float) * 4);
+            colorMapBuffer.SetData(colors);
+            postProcessShader.SetBuffer(postProcessKernel, "ColorMap", colorMapBuffer);
+            
+            // Create a buffer to hold tensor data (will be resized dynamically)
+            int initialTensorSize = imageSize.x * imageSize.y * colors.Length;
+            tensorDataBuffer = new ComputeBuffer(initialTensorSize, sizeof(float));
+            postProcessShader.SetBuffer(postProcessKernel, "TensorData", tensorDataBuffer);
+            
+            postProcessShader.SetInt("numClasses", colors.Length);
+            postProcessShader.SetTexture(postProcessKernel, "OutputTexture", segmentationTexture);
+            Debug.Log("GPU resources initialized for post-processing.");
+      }
+
+      private IEnumerator DetectOptimalImageSize()
+      {
+            Debug.Log("=== AUTO-DETECTING OPTIMAL IMAGE SIZE ===");
+            
+            // Common resolutions to try, ordered by preference (performance vs quality)
+            Vector2Int[] resolutionsToTry;
+            
+            if (modelAsset.name.Contains("TopFormer"))
+            {
+                  Debug.Log("TopFormer model detected. Testing compatible resolutions...");
+                  // TopFormer typically needs 512x512, but we'll try optimized versions first
+                  resolutionsToTry = new Vector2Int[]
+                  {
+                        new Vector2Int(512, 512),  // Original size - should work
+                        new Vector2Int(384, 384),  // 75% of original
+                        new Vector2Int(256, 256),  // 50% of original (our optimization attempt)
+                        new Vector2Int(320, 320),  // Between 256 and 384
+                        new Vector2Int(448, 448),  // Between 384 and 512
+                  };
+            }
+            else
+            {
+                  Debug.Log("Lightweight model detected. Testing efficient resolutions...");
+                  resolutionsToTry = new Vector2Int[]
+                  {
+                        new Vector2Int(224, 224),  // Common for lightweight models
+                        new Vector2Int(256, 256),  // Slightly higher
+                        new Vector2Int(192, 192),  // Lower for performance
+                        new Vector2Int(160, 160),  // Very low for old devices
+                        new Vector2Int(320, 320),  // Higher quality option
+                  };
+            }
+
+            bool foundValidSize = false;
+
+            foreach (var testSize in resolutionsToTry)
+            {
+                  Debug.Log($"Testing resolution: {testSize.x}x{testSize.y}");
+                  
+                  if (TestImageSize(testSize))
+                  {
+                        validatedImageSize = testSize;
+                        imageSize = testSize;
+                        foundValidSize = true;
+                        
+                        Debug.Log($"✅ SUCCESS: Model works with {testSize.x}x{testSize.y}");
+                        break;
+                  }
+                  else
+                  {
+                        Debug.Log($"❌ FAILED: Model doesn't work with {testSize.x}x{testSize.y}");
+                  }
+                  
+                  yield return null; // Allow other processes to run
+            }
+
+            if (!foundValidSize)
+            {
+                  Debug.LogError("❌ Could not find a compatible image size for this model!");
+                  enabled = false;
+                  yield break;
+            }
+
+            // Apply performance settings based on detected resolution
+            ApplyResolutionBasedSettings();
+
+            // Create input texture with validated size
+            CreateInputTexture();
+            
+            // If we found a valid size, finalize setup
+            if (modelInitialized)
+            {
+                  OnModelReady();
+            }
+            else
+            {
+                  Debug.LogError("Model initialization failed after optimal size detection.");
+                  enabled = false;
+                  yield break;
+            }
+
+            Debug.Log($"=== MODEL READY: Using {validatedImageSize.x}x{validatedImageSize.y} ===");
+      }
+
+      private bool TestImageSize(Vector2Int testSize)
+      {
+            try
+            {
+                  // Create a test texture
+                  var testTexture = new Texture2D(testSize.x, testSize.y, TextureFormat.RGB24, false);
+                  
+                  // Fill with test data
+                  var pixels = new Color32[testSize.x * testSize.y];
+                  for (int i = 0; i < pixels.Length; i++)
+                  {
+                        pixels[i] = new Color32(128, 128, 128, 255); // Gray test image
+                  }
+                  testTexture.SetPixels32(pixels);
+                  testTexture.Apply();
+
+                  // Test model execution
+                  using (var testTensor = new Tensor(testTexture, 3))
+                  {
+                        worker.Execute(testTensor);
+                        using (var output = worker.PeekOutput())
+                        {
+                              // If we get here without exception, the size works
+                              Debug.Log($"Model output shape: {output.width}x{output.height}x{output.channels}");
+                        }
+                  }
+
+                  Destroy(testTexture);
+                  return true;
+            }
+            catch (Exception e)
+            {
+                  Debug.Log($"Test failed: {e.Message}");
+                  return false;
+            }
+      }
+
+      private void ApplyResolutionBasedSettings()
+      {
+            // Auto-enable extreme mode for very high resolution models on first run
+            if (validatedImageSize.x >= 512 && !extremeOptimizationMode)
+            {
+                  Debug.LogWarning("🚨 High resolution model detected (512x512+). Auto-enabling EXTREME optimization mode for better performance!");
+                  extremeOptimizationMode = true;
+            }
+            
+            // Adjust performance settings based on the required resolution
+            if (validatedImageSize.x >= 512)
+            {
+                  // High resolution - very conservative settings for TopFormer
+                  runSchedule = extremeOptimizationMode ? 3.0f : 2.0f; // Much slower for heavy models
+                  frameSkip = extremeOptimizationMode ? 8 : 5; // Skip many more frames
+                  Application.targetFrameRate = extremeOptimizationMode ? 10 : 12;
+                  currentQualityLevel = extremeOptimizationMode ? "Ultra Conservative" : "Conservative";
+                  targetModelTime = 300f; // Allow longer processing time for high-res models
+                  Debug.Log($"Applied {currentQualityLevel.ToUpper()} settings for high resolution model (512x512+)");
+                  Debug.LogWarning("TopFormer 512x512 is very demanding! Consider using extreme optimization mode.");
+            }
+            else if (validatedImageSize.x >= 320)
+            {
+                  // Medium resolution - balanced settings  
+                  runSchedule = extremeOptimizationMode ? 2.0f : 1.5f;
+                  frameSkip = extremeOptimizationMode ? 6 : 4;
+                  Application.targetFrameRate = extremeOptimizationMode ? 12 : 15;
+                  currentQualityLevel = extremeOptimizationMode ? "Conservative" : "Balanced";
+                  targetModelTime = 150f;
+                  Debug.Log($"Applied {currentQualityLevel} settings for medium resolution model");
+            }
+            else
+            {
+                  // Low resolution - performance settings
+                  runSchedule = extremeOptimizationMode ? 1.5f : 1.0f;
+                  frameSkip = extremeOptimizationMode ? 4 : 3;
+                  Application.targetFrameRate = extremeOptimizationMode ? 15 : 20;
+                  currentQualityLevel = extremeOptimizationMode ? "Balanced" : "Performance";
+                  targetModelTime = 100f;
+                  Debug.Log($"Applied {currentQualityLevel} settings for low resolution model");
+            }
+
+            // Override PerformanceManager if present
+            if (performanceManager != null)
+            {
+                  Debug.Log("PerformanceManager will override these settings dynamically");
+            }
+            
+            Debug.Log($"Model processing target: {targetModelTime}ms, Current schedule: {runSchedule}s, Frame skip: {frameSkip}");
+            
+            if (extremeOptimizationMode)
+            {
+                  Debug.Log("🔥 EXTREME OPTIMIZATION MODE ACTIVE 🔥");
+            }
+      }
+
+      private void OnDestroy()
+      {
+            // Unsubscribe from performance manager events
+            if (performanceManager != null)
+            {
+                  performanceManager.OnQualityChanged -= OnQualitySettingsChanged;
+            }
+
+            worker?.Dispose();
+            lastOutputTensor?.Dispose();
+            if (segmentationTexture != null) segmentationTexture.Release();
+            if (colorMapBuffer != null) colorMapBuffer.Release();
+            if (tensorDataBuffer != null) tensorDataBuffer.Release();
+            if (inputTexture != null) Destroy(inputTexture);
+      }
+
+      private void OnQualitySettingsChanged(PerformanceSettings settings)
+      {
+            // Only allow resolution changes if the new size is compatible
+            if (modelInitialized && settings.imageSize != validatedImageSize)
+            {
+                  Debug.LogWarning($"PerformanceManager tried to change resolution to {settings.imageSize.x}x{settings.imageSize.y}, " +
+                                  $"but model requires {validatedImageSize.x}x{validatedImageSize.y}. Ignoring resolution change.");
+                  
+                  // Apply other settings but keep our validated resolution
+                  runSchedule = settings.runSchedule;
+                  frameSkip = settings.frameSkip;
+                  currentQualityLevel = settings.qualityLevel + " (Fixed Resolution)";
+            }
+            else if (!modelInitialized)
+            {
+                  // Update settings before model initialization
+                  imageSize = settings.imageSize;
+                  runSchedule = settings.runSchedule;
+                  frameSkip = settings.frameSkip;
+                  currentQualityLevel = settings.qualityLevel;
+            }
+
+            Debug.Log($"Settings updated: {currentQualityLevel}, " +
+                     $"{runSchedule}s interval, skip {frameSkip} frames");
+      }
+
+      private void CreateInputTexture()
+      {
+            if (inputTexture != null)
+            {
+                  Destroy(inputTexture);
+            }
+            inputTexture = new Texture2D(imageSize.x, imageSize.y, TextureFormat.RGB24, false);
       }
 
       private void OnEnable()
@@ -135,15 +480,17 @@ public class SegmentationManager : MonoBehaviour
             cameraManager.frameReceived -= OnCameraFrameReceived;
       }
 
-      private void OnDestroy()
-      {
-            worker?.Dispose();
-            lastOutputTensor?.Dispose();
-            Destroy(segmentationTexture);
-      }
-
       private void OnCameraFrameReceived(ARCameraFrameEventArgs eventArgs)
       {
+            // Don't process until model is properly initialized
+            if (!modelInitialized) return;
+            
+            // Check if model processing is paused
+            if (pauseModelProcessing)
+            {
+                  return;
+            }
+
             // Skip frames for better performance
             frameCounter++;
             if (frameCounter <= frameSkip)
@@ -152,12 +499,30 @@ public class SegmentationManager : MonoBehaviour
             }
             frameCounter = 0;
 
+            // Timing-based throttling
             if (Time.time - lastRunTime < runSchedule)
             {
                   return;
             }
+            
+            // Auto-optimization: skip if recent model processing was too slow
+            if (autoOptimizationEnabled && lastModelTime > maxModelProcessingTime)
+            {
+                  consecutiveSlowFrames++;
+                  if (consecutiveSlowFrames > 3)
+                  {
+                        // Temporarily increase run schedule to give device a break
+                        float tempSchedule = runSchedule * 1.5f;
+                        Debug.LogWarning($"Model too slow ({lastModelTime:F0}ms), temporarily increasing schedule to {tempSchedule:F1}s");
+                        
+                        if (Time.time - lastRunTime < tempSchedule)
+                        {
+                              return;
+                        }
+                  }
+            }
+            
             lastRunTime = Time.time;
-
             ProcessImage();
       }
 
@@ -176,8 +541,8 @@ public class SegmentationManager : MonoBehaviour
                   transformation = XRCpuImage.Transformation.MirrorY
             };
 
-            var texture = new Texture2D(conversionParams.outputDimensions.x, conversionParams.outputDimensions.y, conversionParams.outputFormat, false);
-            var buffer = texture.GetRawTextureData<byte>();
+            // Reuse the pre-created texture instead of creating new one
+            var buffer = inputTexture.GetRawTextureData<byte>();
 
             try
             {
@@ -188,72 +553,106 @@ public class SegmentationManager : MonoBehaviour
                   cpuImage.Dispose();
             }
 
-            texture.Apply();
-            StartCoroutine(RunModel(texture));
+            inputTexture.Apply();
+            StartCoroutine(RunModel(inputTexture));
       }
 
       private IEnumerator RunModel(Texture2D texture)
       {
+            var startTime = Time.realtimeSinceStartup;
+            
             using var inputTensor = new Tensor(texture, 3);
 
+            // Schedule model execution
+            worker.StartManualSchedule(inputTensor);
+
+            // Wait for completion by checking the progress
+            yield return new WaitUntil(() => worker.scheduleProgress >= 1.0f);
+
+            // Now that we are past the yield, we can use try-catch for robust error handling
             try
             {
-                  worker.Execute(inputTensor);
+                  // A negative progress indicates an error during execution
+                  if (worker.scheduleProgress < 0)
+                  {
+                        throw new System.Exception($"Model execution failed. Progress: {worker.scheduleProgress}");
+                  }
 
-                  // Get the output and dispose of the previous one
+                  // Get the output tensor.
                   lastOutputTensor?.Dispose();
                   lastOutputTensor = worker.PeekOutput();
 
-                  // On the first run, initialize the texture with the correct size from the model output
-                  if (segmentationTexture == null)
+                  // --- GPU Post-Processing ---
+                  // Set shader parameters and dispatch.
+                  
+                  // Transfer tensor data to GPU buffer
+                  var tensorData = lastOutputTensor.ToReadOnlyArray();
+                  if (tensorDataBuffer.count != tensorData.Length)
                   {
-                        segmentationTexture = new Texture2D(imageSize.x, imageSize.y, TextureFormat.RGBA32, false)
-                        {
-                              filterMode = FilterMode.Bilinear
-                        };
-                        rawImage.texture = segmentationTexture;
+                        tensorDataBuffer.Dispose();
+                        tensorDataBuffer = new ComputeBuffer(tensorData.Length, sizeof(float));
+                        postProcessShader.SetBuffer(postProcessKernel, "TensorData", tensorDataBuffer);
+                  }
+                  tensorDataBuffer.SetData(tensorData);
+                  
+                  // Set tensor dimensions for the shader
+                  postProcessShader.SetInt("tensorWidth", lastOutputTensor.width);
+                  postProcessShader.SetInt("tensorHeight", lastOutputTensor.height);
+                  postProcessShader.SetInt("classIndexToPaint", classIndexToPaint);
+                  
+                  // Calculate the number of thread groups needed to cover the texture.
+                  int threadGroupsX = Mathf.CeilToInt(segmentationTexture.width / 8.0f);
+                  int threadGroupsY = Mathf.CeilToInt(segmentationTexture.height / 8.0f);
+                  postProcessShader.Dispatch(postProcessKernel, threadGroupsX, threadGroupsY, 1);
+                  // --- End of GPU Post-Processing ---
 
-                        // Log model output details once to help with debugging
-                        Debug.Log($"Model output initialized. Texture size: {lastOutputTensor.width}x{lastOutputTensor.height}, Channels/Classes: {lastOutputTensor.channels}");
-
-                        // Debug: Show which classes are most common in the current frame (only once)
-                        if (!hasLoggedStatistics)
-                        {
-                              LogClassStatistics();
-                              hasLoggedStatistics = true;
-                        }
+                  // Track model processing time
+                  var processingTime = Time.realtimeSinceStartup - startTime;
+                  lastModelTime = processingTime * 1000f; // Convert to milliseconds
+                  
+                  modelProcessingTime += processingTime;
+                  modelRunCount++;
+                  
+                  // Track recent performance for auto-optimization
+                  recentModelTimes += lastModelTime;
+                  recentModelCount++;
+                  
+                  // Reset consecutive slow frames if performance is good
+                  if (lastModelTime <= targetModelTime)
+                  {
+                        consecutiveSlowFrames = 0;
                   }
 
-                  // Process the output and update the texture
-                  SegmentationPostProcessing.ProcessOutput(lastOutputTensor, segmentationTexture, classIndexToPaint, paintColor);
-
-                  // Adjust RawImage aspect ratio to match the screen
-                  var screenAspect = (float)Screen.width / Screen.height;
-                  var imageAspect = (float)segmentationTexture.width / segmentationTexture.height;
-
-                  if (screenAspect > imageAspect)
+                  // Report performance issues if model takes too long
+                  if (performanceManager != null && lastModelTime > maxModelProcessingTime)
                   {
-                        rawImage.rectTransform.localScale = new Vector3(imageAspect / screenAspect, 1, 1);
+                        performanceManager.ReportPerformanceIssue();
                   }
-                  else
+                  
+                  // Log extremely slow processing
+                  if (lastModelTime > maxModelProcessingTime * 2)
                   {
-                        rawImage.rectTransform.localScale = new Vector3(1, screenAspect / imageAspect, 1);
+                        Debug.LogWarning($"⚠️ Very slow model processing: {lastModelTime:F0}ms (target: {targetModelTime:F0}ms)");
                   }
             }
-            catch (Exception e)
+            catch (System.Exception e)
             {
                   Debug.LogError($"Model execution failed: {e.Message}");
                   if (inputTensor != null)
                   {
                         Debug.LogError($"Input tensor shape: {inputTensor.shape}");
                   }
-                  Debug.LogError("Try adjusting the imageSize to match model requirements or assign a different model.");
+                  Debug.LogError("Model execution error occurred during runtime");
+                  
+                  // Report performance issue on model execution failure
+                  if (performanceManager != null)
+                  {
+                        performanceManager.ReportPerformanceIssue();
+                  }
+                  
+                  // Auto-pause on repeated failures
+                  consecutiveSlowFrames += 5; // Treat errors as very slow frames
             }
-
-            // Clean up
-            inputTensor.Dispose();
-
-            yield return null;
       }
 
       private void LogClassStatistics()
@@ -283,6 +682,7 @@ public class SegmentationManager : MonoBehaviour
                   }
             }
 
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
             Debug.Log("=== CLASS STATISTICS ===");
             for (int i = 0; i < classCount.Length; i++)
             {
@@ -293,10 +693,14 @@ public class SegmentationManager : MonoBehaviour
                   }
             }
             Debug.Log("========================");
+#endif
       }
 
       void Update()
       {
+            // Performance monitoring
+            UpdatePerformanceStats();
+
             // Check for screen tap
             if (Input.GetMouseButtonDown(0))
             {
@@ -307,7 +711,9 @@ public class SegmentationManager : MonoBehaviour
                   {
                         // Double tap detected - clear selection
                         classIndexToPaint = -1;
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
                         Debug.Log("Selection cleared. Showing all classes.");
+#endif
 
                         if (displayNameCoroutine != null)
                         {
@@ -327,6 +733,84 @@ public class SegmentationManager : MonoBehaviour
                   }
 
                   lastTapTime = currentTime;
+            }
+      }
+
+      private void UpdatePerformanceStats()
+      {
+            if (!showPerformanceStats || performanceText == null) return;
+
+            frameTime += Time.unscaledDeltaTime;
+            frameCount++;
+
+            // Update stats every second
+            if (frameTime >= 1.0f)
+            {
+                  float fps = frameCount / frameTime;
+                  
+                  // Calculate average model processing time
+                  if (modelRunCount > 0)
+                  {
+                        averageModelTime = (modelProcessingTime / modelRunCount) * 1000f; // Convert to milliseconds
+                  }
+                  
+                  // Calculate recent average for more responsive monitoring
+                  float recentAverage = recentModelCount > 0 ? recentModelTimes / recentModelCount : 0f;
+
+                  // Get memory usage
+                  long memoryUsage = System.GC.GetTotalMemory(false) / (1024 * 1024); // MB
+
+                  // Determine status and warnings
+                  string statusText = modelInitialized ? "Ready" : "Initializing...";
+                  string performanceStatus = "";
+                  
+                  if (pauseModelProcessing)
+                  {
+                        statusText = "PAUSED";
+                        performanceStatus = "⏸️";
+                  }
+                  else if (recentAverage > maxModelProcessingTime)
+                  {
+                        performanceStatus = "🐌 SLOW";
+                  }
+                  else if (recentAverage > targetModelTime)
+                  {
+                        performanceStatus = "⚠️ HIGH";
+                  }
+                  else if (modelInitialized)
+                  {
+                        performanceStatus = "✅ GOOD";
+                  }
+
+                  // Update performance text with detailed info
+                  performanceText.text = $"FPS: {fps:F1} {performanceStatus}\n" +
+                                        $"Model: {averageModelTime:F0}ms (recent: {recentAverage:F0}ms)\n" +
+                                        $"Target: {targetModelTime:F0}ms | Max: {maxModelProcessingTime:F0}ms\n" +
+                                        $"Memory: {memoryUsage}MB\n" +
+                                        $"Quality: {currentQualityLevel}\n" +
+                                        $"Resolution: {imageSize.x}x{imageSize.y}\n" +
+                                        $"Schedule: {runSchedule:F1}s | Skip: {frameSkip}\n" +
+                                        $"Status: {statusText}" +
+                                        (extremeOptimizationMode ? " [EXTREME]" : "") +
+                                        (consecutiveSlowFrames > 0 ? $" | Slow: {consecutiveSlowFrames}" : "");
+
+                  // Reset counters
+                  frameTime = 0f;
+                  frameCount = 0;
+                  
+                  // Reset recent tracking periodically
+                  if (recentModelCount > 5)
+                  {
+                        recentModelTimes = 0f;
+                        recentModelCount = 0;
+                  }
+                  
+                  // Reset model timing if we have enough samples
+                  if (modelRunCount > 10)
+                  {
+                        modelProcessingTime = 0f;
+                        modelRunCount = 0;
+                  }
             }
       }
 
@@ -382,7 +866,9 @@ public class SegmentationManager : MonoBehaviour
                   {
                         // Get the class name and log it
                         string className = ColorMap.classNames[classIndex];
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
                         Debug.Log($"You tapped on: {className} (class index: {classIndex}). Painting it.");
+#endif
 
                         // Show class name on UI
                         if (displayNameCoroutine != null)
@@ -410,5 +896,70 @@ public class SegmentationManager : MonoBehaviour
                   yield return new WaitForSeconds(displayNameDuration);
                   classNameText.enabled = false;
             }
+      }
+
+      // Public methods for external control
+      public void SetRunSchedule(float schedule)
+      {
+            runSchedule = Mathf.Max(0.1f, schedule);
+      }
+
+      public void SetFrameSkip(int skip)
+      {
+            frameSkip = Mathf.Max(0, skip);
+      }
+
+      public void SetImageSize(Vector2Int size)
+      {
+            if (modelInitialized && size != validatedImageSize)
+            {
+                  Debug.LogWarning($"Cannot change image size to {size.x}x{size.y}. Model requires {validatedImageSize.x}x{validatedImageSize.y}");
+                  return;
+            }
+            
+            imageSize = size;
+            CreateInputTexture();
+      }
+
+      // Public methods for runtime performance control
+      [ContextMenu("Toggle Extreme Optimization")]
+      public void ToggleExtremeOptimization()
+      {
+            extremeOptimizationMode = !extremeOptimizationMode;
+            Debug.Log($"Extreme optimization mode: {(extremeOptimizationMode ? "ENABLED" : "DISABLED")}");
+            
+            if (modelInitialized)
+            {
+                  ApplyResolutionBasedSettings();
+            }
+      }
+      
+      [ContextMenu("Toggle Model Processing")]
+      public void ToggleModelProcessing()
+      {
+            pauseModelProcessing = !pauseModelProcessing;
+            Debug.Log($"Model processing: {(pauseModelProcessing ? "PAUSED" : "RESUMED")}");
+      }
+      
+      [ContextMenu("Force Model Run")]
+      public void ForceModelRun()
+      {
+            if (modelInitialized && !pauseModelProcessing)
+            {
+                  lastRunTime = 0f; // Reset timer to force immediate run
+                  Debug.Log("Forcing immediate model run...");
+            }
+      }
+      
+      public void SetMaxProcessingTime(float maxTimeMs)
+      {
+            maxModelProcessingTime = Mathf.Max(50f, maxTimeMs);
+            Debug.Log($"Max processing time set to {maxModelProcessingTime}ms");
+      }
+      
+      public void EnableAutoOptimization(bool enabled)
+      {
+            autoOptimizationEnabled = enabled;
+            Debug.Log($"Auto-optimization: {(enabled ? "ENABLED" : "DISABLED")}");
       }
 }

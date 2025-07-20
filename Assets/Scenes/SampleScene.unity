@@ -2323,10 +2323,17 @@ MonoBehaviour:
   rawImage: {fileID: 1040099461}
   classNameText: {fileID: 0}
   displayNameDuration: 3
+  showPerformanceStats: 1
+  performanceText: {fileID: 0}
+  extremeOptimizationMode: 0
+  pauseModelProcessing: 0
+  maxModelProcessingTime: 200
   runSchedule: 0.1
   paintColor: {r: 0, g: 0, b: 1, a: 1}
   modelAsset: {fileID: 5022602860645237092, guid: 37cd09fbcd27344fe8b8294f637cbf9f,
     type: 3}
+  postProcessShader: {fileID: 7200000, guid: 7bfc0a34d6f3d0240824b2bf861971d9, type: 3}
+  overrideResolution: {x: 256, y: 256}
 --- !u!1 &846715049
 GameObject:
   m_ObjectHideFlags: 0

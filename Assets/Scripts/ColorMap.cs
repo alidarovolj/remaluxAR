@@ -124,6 +124,11 @@ public static class ColorMap
             return GenerateColorFromIndex(classIndex);
       }
 
+      public static Color[] GetAllColors()
+      {
+            return colorMap;
+      }
+
       private static Color32 GenerateColorFromIndex(int index)
       {
             // Generate a deterministic but varied color based on the index
